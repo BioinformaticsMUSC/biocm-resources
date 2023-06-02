@@ -149,14 +149,20 @@ CARD requires the following inputs:
 spatial_counts <- seurat@assays[['Spatial']]@counts
 spatial_counts <- as(as.matrix(spatial_counts), "sparseMatrix")
 spatial_locations <- seurat@images[["slice1"]]@coordinates |> 
-  select(row, col) |> 
-  dplyr::rename(x = row) |> 
-  dplyr::rename(y = col)
+  select(col, row) |> 
+  dplyr::rename(x = col) |>
+  dplyr::rename(y = row) 
 head(spatial_locations)
 ```
 
 
-Need single cell data - data is taken from: https://www.nature.com/articles/s41586-018-0654-5 via the python package squidpy.
+Note: the coordinates from space ranger start at the top left, while CARD assumes the bottom left is the origin. Thus, to have the image remain in the same orientation as the image file and outputs from Seurat analysis, we need to convert the y coordinates to negative values.
+
+```{r}
+spatial_locations$y <- spatial_locations$y * -1
+```
+
+And for the single cell reference data - data is taken from: https://www.nature.com/articles/s41586-018-0654-5 via the python package squidpy.
 
 For CARD, we need the raw counts and metadata from this data.
 
