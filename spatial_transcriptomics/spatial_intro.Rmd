@@ -1,0 +1,219 @@
+---
+title: 'Spatial Analysis: Seurat v5'
+output: html_document
+date: "2023-05-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Spatial Analysis
+
+This is an R markdown document showing very basic spatial analysis using Seurat v5. The data is from a healthy mouse brain downloaded from 10X datasets. The data was processed using Space Ranger on the palmetto cluster.
+
+This analysis was performed on the palmetto cluster using the biocm-seurat-v5 singularity image.
+
+```{r cars}
+suppressMessages(suppressWarnings({library(Seurat)
+  library(SeuratData)
+  library(ggplot2)
+  library(patchwork)
+  library(dplyr)
+  library(Matrix)
+  library(CARD)
+}))
+```
+
+Loading the data directly from the Space Ranger outputs.
+
+```{r load data}
+seurat <- Load10X_Spatial(
+	data.dir = '/mnt/bg/spatial/sr_out/Visium_FFPE_Mouse_Brain/outs',
+	filename = "filtered_feature_bc_matrix.h5",
+	assay = 'Spatial')
+
+seurat
+```
+
+Once the data is in the seurat object, a few simple QC plots can be generated.
+
+```{r qc_metrics}
+p1 <- VlnPlot(seurat, features = "nCount_Spatial", pt.size = 0.1) + NoLegend()
+p2 <- SpatialFeaturePlot(seurat, features = "nCount_Spatial") + theme(legend.position = "right")
+wrap_plots(p1, p2)
+
+```
+
+
+Perform SCT on data
+
+```{r}
+seurat <- SCTransform(seurat, assay = "Spatial", verbose = F)
+```
+
+Examining the spatial expression of various genes using SpatialFeaturePlot
+
+```{r}
+p1 <- SpatialFeaturePlot(seurat, features = "Il1rapl1")
+p2 <- SpatialFeaturePlot(seurat, features = "Adam33")
+p3 <- SpatialFeaturePlot(seurat, features = "Vgf")
+wrap_plots(p1, p2, p3)
+```
+
+Now running the typical dimensionality reduction and clustering algorithms
+
+```{r}
+seurat <- RunPCA(seurat, assay = "SCT")
+seurat <- FindNeighbors(seurat, reduction = "pca", dims = 1:30)
+seurat <- FindClusters(seurat)
+seurat <- RunUMAP(seurat, reduction = "pca", dims = 1:30)
+```
+
+We can now look at the DimPlot in UMAP 2D space next to the spatial image with correlated regions
+
+```{r}
+p1 <- DimPlot(seurat, reduction = "umap", label = TRUE)
+p2 <- SpatialDimPlot(seurat, label = TRUE, label.size = 3)
+wrap_plots(p1, p2)
+```
+
+To examine specific clusters more clearly, we can use the 'cells.highlight' parameter in SpatialDimPlot:
+
+```{r}
+SpatialDimPlot(seurat, cells.highlight = CellsByIdentities(object = seurat, idents = c(0, 1, 2, 3, 4, 5)), facet.highlight = TRUE, ncol = 3, cols.highlight=c('red','grey75'))
+
+```
+
+
+We can also find spatial markers
+
+```{r}
+de_markers <- FindMarkers(seurat, ident.1 = 0, ident.2 = 1)
+SpatialFeaturePlot(object = seurat, features = rownames(de_markers)[1:3], alpha = c(0.1, 1), ncol = 3)
+```
+
+
+And the top spatially variable features:
+
+```{r}
+seurat <- FindSpatiallyVariableFeatures(seurat, assay = "SCT", features = VariableFeatures(seurat)[1:1000],
+    selection.method = "moransi")
+
+top.features <- seurat@assays[["SCT"]]@meta.features |> as.data.frame() |>
+  arrange(moransi.spatially.variable.rank) |> head(6) |> rownames()
+
+SpatialFeaturePlot(seurat, features = top.features, ncol = 3, alpha = c(0.1, 1))
+
+```
+
+Now to inspect the 'Spatial' Assay:
+
+```{r}
+seurat
+```
+
+Examining the counts layer in the Spatial Assay:
+
+```{r}
+seurat@assays[['Spatial']]@counts[1:5,1:5]
+```
+
+The feature matrix here looks like a typical RNA count matrix, but the barcodes (columns) are not cells—rather, they are spots on the slide. The rows are still genes, so the matrix shows the amount of genes detected in each spot on the capture slide. Each spot may contain multiple cells. In theory, similar cells will exist next to each other, but it takes further analysis to predict the cell type(s) found in each spot. This is called deconvolution and is presented below.
+
+The coordinates for each spot in the image are located in the image layer:
+
+```{r}
+seurat@images[["slice1"]]@coordinates[1:10,]
+```
+
+
+
+### DECONVOLUTION
+
+There are several tools that use probabilistic methods to predict the proportion of each cell type within each spot. For an overview of many of these tools (and those that use other methods), see: https://www.nature.com/articles/s41467-023-37168-7
+
+Many of these tools require a scRNA-seq reference dataset, although a few can perform deconvolution without one (STdeconvolve, for example).
+
+This analysis will use CARD, and R-based method for cellular deconvolution in spatial transcriptomics: https://github.com/YingMa0107/CARD
+
+CARD requires the following inputs:
+-Spatial transcriptomic count matrix
+-Spatial coordinates (in a df with columns "x" and "y" for each cell)
+-single cell RNA count matrix
+-single cell metadata, which includes cell-type annotation and sample divisions
+
+
+
+```{r}
+spatial_counts <- seurat@assays[['Spatial']]@counts
+spatial_counts <- as(as.matrix(spatial_counts), "sparseMatrix")
+spatial_locations <- seurat@images[["slice1"]]@coordinates |> 
+  select(row, col) |> 
+  dplyr::rename(x = row) |> 
+  dplyr::rename(y = col)
+head(spatial_locations)
+```
+
+
+Need single cell data - data is taken from: https://www.nature.com/articles/s41586-018-0654-5 via the python package squidpy.
+
+For CARD, we need the raw counts and metadata from this data.
+
+```{r}
+#load sc data
+mouse <- readRDS('/mnt/bg/spatial/mouse_cortex_ref.rds')
+sc_counts <- mouse@assays[['RNA']]$counts
+sc_counts <- as(as.matrix(sc_counts), "sparseMatrix")
+
+sc_meta <- mouse@meta.data
+```
+
+
+Create CARD object
+
+```{r}
+CARD_obj = createCARDObject(
+	sc_count = sc_counts,
+	sc_meta = sc_meta,
+	spatial_count = spatial_counts,
+	spatial_location = spatial_locations,
+	ct.varname = "cell_subclass",
+	ct.select = NULL,
+	sample.varname = 'orig.ident',
+	minCountGene = 100,
+	minCountSpot = 5) 
+```
+
+Run deconvolution
+
+```{r}
+CARD_obj = CARD_deconvolution(CARD_object = CARD_obj)
+```
+
+Now we can visualize the results using CARD's visiualize.pie function, which plots a small pie chart for each spot in the capture slide.
+
+```{r}
+p1 <- CARD.visualize.pie(proportion = CARD_obj@Proportion_CARD,spatial_location = CARD_obj@spatial_location)
+p1
+```
+
+This can be a little hard to read, so we can subset for specific cells. For each cell, we are plotting the proportion of each cell type in each capture slide spot.
+
+```{r}
+ct.visualize = c("Astro", "L4", "Oligo")
+p2 <- CARD.visualize.prop(
+	proportion = CARD_obj@Proportion_CARD,        
+	spatial_location = CARD_obj@spatial_location, 
+	ct.visualize = ct.visualize,                
+	colors = c("lightblue","lightyellow","red"), 
+	NumCols = 3) 
+
+```
+
+![CARD proportion plot.](/mnt/bg/spatial/card_deconv2.jpg)
+
+The CARD tutorial shows further visualizations, including refining the resolution of these plots.
+
+https://yingma0107.github.io/CARD/documentation/04_CARD_Example.html
+
