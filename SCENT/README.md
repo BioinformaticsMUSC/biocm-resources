@@ -1,0 +1,2 @@
+# biocm-resources
+## SCENT pipeline
